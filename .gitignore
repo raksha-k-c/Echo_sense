@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+session_log.csv
+# image data is rebuilt with build_dataset.py
+dataset/
+/*.jpg
+/GB/
+/Hepatic/
+/Kidney/
+/Liver/
+/Ovaries/
+/Pancreas/
+/Portal/
+/Spleen/
+/UB+prostrate+uterous+cervix/
+# documents
+*.ppt
+*.pptx
+*.pdf
+*.docx
