@@ -2,7 +2,7 @@
 #include <Wire.h>
 
 const int MPU = 0x68;
-const int FSR_PIN = 34;
+const int FSR_PIN = 4;                    // FSR signal is on D4
 
 void setup() {
   Serial.begin(115200);
