@@ -1,24 +1,29 @@
-import cv2, numpy as np, serial, time, csv, os
+import cv2, numpy as np, serial, time, glob, os
 
 # ---------------- SETTINGS ----------------
 SERIAL_PORT = "COM3"
 CAMERA_INDEX = 0
-CONTACT = 300            # pressure needed before the image appears
 MARKER_IDS = None        # None = any marker; use (23, 24) once printed
+MIN_AREA = 800           # ignore markers smaller than this (pixels); lower if yours is skipped
 
-# (label, x1, y1, x2, y2, organ in dataset/tags.csv); positions are fractions of the camera picture
+CONTACT_ON = 300         # press harder than this to show the image
+CONTACT_OFF = 180        # image stays until force falls below this
+DEADBAND_PX = 3          # position changes smaller than this are ignored
+STEP_MARGIN = 0.8        # how far (in image steps) you must move before the image changes
+ZONE_MARGIN = 0.02       # extra room before leaving the current organ zone
+TILT_DEADBAND = 2.0      # degrees of tilt ignored
+
+# (organ, x1, y1, x2, y2, image folder); positions are fractions of the camera picture
 ZONES = [
-    ("Liver",        0.00, 0.0, 0.30, 0.5, "Liver"),
-    ("Gallbladder",  0.30, 0.0, 0.50, 0.5, "Gallbladder"),
-    ("Pancreas",     0.50, 0.0, 0.70, 0.5, "Pancreas"),
-    ("Spleen",       0.70, 0.0, 1.00, 0.5, "Spleen"),
-    ("Right kidney", 0.00, 0.5, 0.30, 1.0, "Kidney"),
-    ("Pelvis",       0.30, 0.5, 0.50, 1.0, "Pelvis"),
-    ("Ovaries",      0.50, 0.5, 0.70, 1.0, "Ovaries"),
-    ("Left kidney",  0.70, 0.5, 1.00, 1.0, "Kidney"),
+    ("Liver",        0.00, 0.0, 0.25, 0.5, "data/liver"),
+    ("Gallbladder",  0.25, 0.0, 0.50, 0.5, "data/gallbladder"),
+    ("Pancreas",     0.50, 0.0, 0.75, 0.5, "data/pancreas"),
+    ("Spleen",       0.75, 0.0, 1.00, 0.5, "data/spleen"),
+    ("Right kidney", 0.00, 0.5, 0.25, 1.0, "data/kidney"),
+    ("Pelvis",       0.25, 0.5, 0.50, 1.0, "data/pelvis"),
+    ("Ovaries",      0.50, 0.5, 0.75, 1.0, "data/ovaries"),
+    ("Left kidney",  0.75, 0.5, 1.00, 1.0, "data/kidney"),
 ]
-TAGS = "dataset/tags.csv"   # made by build_dataset.py: organ, file, sweep, pitch, roll
-LOG = "session_log.csv"     # press l to start/stop logging
 CREDITS = ["Images: open datasets (CC BY 4.0)", "Karim 2025, MSU Scholars Junction"]
 # ------------------------------------------
 
@@ -29,24 +34,14 @@ except Exception:
     print("ESP32 not found - running without tilt and pressure")
 
 
-def load_tags():
-    tags = {}
-    if os.path.exists(TAGS):
-        with open(TAGS) as fh:
-            for r in csv.DictReader(fh):
-                tags.setdefault(r["organ"], []).append(
-                    (os.path.join("dataset", r["file"]), float(r["sweep"]), float(r["pitch"]), float(r["roll"])))
-    return tags
+def list_images(folder):
+    files = []
+    for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
+        files += glob.glob(os.path.join(folder, ext))
+    return sorted(files)
 
 
-def match(entries, sweep, pitch, roll):
-    """Nearest tagged image to the probe pose (sweep position, pitch, roll)."""
-    return min(range(len(entries)), key=lambda k: (entries[k][1] - sweep) ** 2
-               + ((entries[k][2] - pitch) / 30) ** 2 + ((entries[k][3] - roll) / 30) ** 2)
-
-
-tags = load_tags()
-zone_files = [tags.get(z[5], []) for z in ZONES]
+zone_files = [list_images(z[5]) for z in ZONES]
 cache = {}
 
 
@@ -74,11 +69,35 @@ def apply_tgc(img, gain, tgc):
     return np.clip(img.astype(np.float32) * gain * ramp, 0, 255).astype(np.uint8)
 
 
+def dz(v, d):
+    """ignore small values, keep the part beyond the dead zone"""
+    return 0.0 if abs(v) < d else v - np.sign(v) * d
+
+
 def apply_tilt(img, p, r):
     h, w = img.shape[:2]
-    dx = int(np.clip(r, -30, 30) / 30 * 40)
-    dy = int(np.clip(p, -30, 30) / 30 * 40)
+    dx = int(np.clip(dz(r, TILT_DEADBAND), -30, 30) / 30 * 40)
+    dy = int(np.clip(dz(p, TILT_DEADBAND), -30, 30) / 30 * 40)
     return cv2.warpAffine(img, np.float32([[1, 0, dx], [0, 1, dy]]), (w, h))
+
+
+def find_zone(fx, fy, current):
+    if current is not None:
+        _, x1, y1, x2, y2, _ = ZONES[current]
+        m = ZONE_MARGIN
+        if x1 - m <= fx < x2 + m and y1 - m <= fy < y2 + m:
+            return current                     # stay in the zone until clearly outside
+    for i, (_, x1, y1, x2, y2, _) in enumerate(ZONES):
+        if x1 <= fx < x2 and y1 <= fy < y2:
+            return i
+    return None
+
+
+def pick_index(frac, n, k):
+    target = float(np.clip(frac, 0, 1)) * (n - 1)
+    if k is None or k >= n or abs(target - k) > STEP_MARGIN:
+        return int(round(target))
+    return k                                   # not moved enough: keep the same image
 
 
 cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -90,8 +109,9 @@ gain, tgc = 1.0, 0.0
 buf = ""
 smooth = None
 last_seen = 0.0
-logf = logw = None
-shown_name = ""
+touching = False
+cur_zone = None
+cur_k = None
 
 while True:
     # tilt and pressure from the ESP32
@@ -109,28 +129,39 @@ while True:
         break
     h, w = frame.shape[:2]
 
-    # find the marker
+    # find the marker (ignore tiny false detections)
     corners, ids, _ = detector.detectMarkers(frame)
     if ids is not None:
         cv2.aruco.drawDetectedMarkers(frame, corners, ids)
         good = [c[0] for c, i in zip(corners, ids.flatten())
-                if MARKER_IDS is None or int(i) in MARKER_IDS]
+                if (MARKER_IDS is None or int(i) in MARKER_IDS)
+                and cv2.contourArea(c[0]) > MIN_AREA]
         if good:
             cx, cy = np.mean([g.mean(axis=0) for g in good], axis=0)
             dx, dy = good[0][1] - good[0][0]
             yaw = float(np.degrees(np.arctan2(dy, dx)))
-            smooth = (cx, cy) if smooth is None else (0.6 * smooth[0] + 0.4 * cx, 0.6 * smooth[1] + 0.4 * cy)
+            if smooth is None:
+                smooth = (cx, cy)
+            elif np.hypot(cx - smooth[0], cy - smooth[1]) > DEADBAND_PX:
+                smooth = (0.7 * smooth[0] + 0.3 * cx, 0.7 * smooth[1] + 0.3 * cy)
             last_seen = time.time()
 
     seen = smooth is not None and time.time() - last_seen < 0.5
     fx = smooth[0] / w if seen else 0.0
     fy = smooth[1] / h if seen else 0.0
 
+    # organ zone, with a little stickiness
+    new_zone = find_zone(fx, fy, cur_zone) if seen else None
+    if new_zone != cur_zone:
+        cur_k = None
+    cur_zone = new_zone
     active = None
-    if seen:
-        for i, (name, x1, y1, x2, y2, _) in enumerate(ZONES):
-            if x1 <= fx < x2 and y1 <= fy < y2:
-                active = (i, (fx - x1) / (x2 - x1))
+    if cur_zone is not None:
+        _, x1, y1, x2, y2, _ = ZONES[cur_zone]
+        active = (cur_zone, (fx - x1) / (x2 - x1))
+
+    # contact with separate on and off levels
+    touching = (force > CONTACT_OFF) if touching else (force > CONTACT_ON)
 
     # camera window
     for i, (name, x1, y1, x2, y2, _) in enumerate(ZONES):
@@ -146,7 +177,6 @@ while True:
     cv2.imshow("Camera (tracking)", frame)
 
     # ultrasound screen
-    touching = force > CONTACT
     view = np.zeros((480, 640, 3), np.uint8)
     info = []
     msg = "No probe detected"
@@ -155,19 +185,18 @@ while True:
         files = zone_files[zi]
         info.append(f"Region: {ZONES[zi][0]}")
         if not files:
-            msg = "No tagged images: run build_dataset.py"
+            msg = "No images in " + ZONES[zi][5]
         elif not touching:
             msg = "Press probe on the body"
         else:
-            k = match(files, frac, pitch - pitch0, roll - roll0)
-            img = load(files[k][0])
+            cur_k = pick_index(frac, len(files), cur_k)
+            img = load(files[cur_k])
             if img is None:
                 msg = "Could not read image"
             else:
                 view = apply_tilt(apply_tgc(fit(img), gain, tgc), pitch - pitch0, roll - roll0)
                 msg = None
-                info.append(f"Image {k + 1} of {len(files)}")
-                shown_name = files[k][0]
+                info.append(f"Image {cur_k + 1} of {len(files)}")
     if msg:
         cv2.putText(view, msg, (110, 250), cv2.FONT_HERSHEY_SIMPLEX, 1, (150, 150, 150), 2)
 
@@ -181,7 +210,6 @@ while True:
         f"Gain {gain:.1f}    TGC {tgc:+.1f}",
         "[ ] gain   , . TGC",
         "z zero tilt   q quit",
-        "l log " + ("ON" if logf else "off"),
     ]
     panel = np.full((480, 300, 3), 30, np.uint8)
     for n, text in enumerate(info):
@@ -192,23 +220,9 @@ while True:
                     0.4, (150, 150, 150), 1, cv2.LINE_AA)
     cv2.imshow("EchoSense", np.hstack([view, panel]))
 
-    if logw:
-        logw.writerow([f"{time.time():.3f}", int(seen), f"{fx:.3f}", f"{fy:.3f}", f"{yaw:.1f}",
-                       f"{pitch - pitch0:.1f}", f"{roll - roll0:.1f}", f"{force:.0f}", int(touching),
-                       ZONES[active[0]][0] if active else "", shown_name if (active and touching) else ""])
-
     key = cv2.waitKey(1) & 0xFF
     if key == ord("q"):
         break
-    if key == ord("l"):
-        if logf:
-            logf.close()
-            logf = logw = None
-        else:
-            logf = open(LOG, "a", newline="")
-            logw = csv.writer(logf)
-            if logf.tell() == 0:
-                logw.writerow(["t", "tracked", "x", "y", "yaw", "pitch", "roll", "force", "contact", "zone", "image"])
     if key == ord("z"):
         pitch0, roll0 = pitch, roll
     if key == ord("["):
@@ -220,8 +234,6 @@ while True:
     if key == ord("."):
         tgc = min(2.0, tgc + 0.1)
 
-if logf:
-    logf.close()
 cap.release()
 if ser:
     ser.close()
