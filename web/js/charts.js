@@ -12,7 +12,7 @@
     const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chart', role: 'img', 'aria-label': `${opts.name}. ${points.length} points, from ${points[0].value} to ${points.at(-1).value}${unit}.` });
     for (let g = 0; g <= 4; g++) {
       const v = yMin + (yMax - yMin) * g / 4;
-      s.append(svg('line', { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), class: 'grid' }),
+      s.append(svg('line', { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), class: 'gl' }),
                svg('text', { x: m.l - 8, y: Y(v) + 4, class: 'axis', 'text-anchor': 'end' }, Math.round(v)));
     }
     const step = Math.ceil(points.length / 8);

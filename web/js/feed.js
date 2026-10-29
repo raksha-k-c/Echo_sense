@@ -39,7 +39,7 @@
         try {
           const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 1500);
           const res = await fetch(this.url, { cache: 'no-store', signal: ctl.signal }); clearTimeout(to);
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          if (!res.ok) { let m = `HTTP ${res.status}`; try { m = (await res.json()).error || m; } catch { /* not JSON */ } throw new Error(m); }
           this.onData(normalise(await res.json()));
           failed = 0; this.onStatus('connected', `Connected to ${this.url}`);
         } catch (e) {

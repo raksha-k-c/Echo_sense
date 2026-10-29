@@ -65,18 +65,22 @@
   E.DemoFeed = DemoFeed;
 
   /** Twelve-plus weeks of believable history: skill improves with some noise. */
+  const SEED = 42;
   E.generateSampleSessions = (userId, count = 14) => {
     const rnd = E.rng(2024), order = ['liver', 'gallbladder', 'liver', 'kidney', 'spleen', 'gallbladder', 'liver', 'kidney', 'spleen', 'liver', 'gallbladder', 'kidney', 'spleen', 'liver'];
     const out = [];
     for (let i = 0; i < count; i++) {
       const skill = E.clamp(0.0 + 0.72 * (i / (count - 1)) + (rnd() - 0.5) * 0.14, 0.05, 0.95);
       const organ = order[i % order.length];
-      const feed = new DemoFeed(organ, skill, 500 + i);
+      const feed = new DemoFeed(organ, skill, SEED + i);
       const samples = [];
       let t = 0, extra = 0;
       while (t < 600 && extra < 3) { samples.push({ t, ...feed.step(0.5) }); t += 0.5; if (feed.done) extra += 0.5; }
-      const hoursAgo = i === count - 1 ? 3 : (count - 1 - i) * 60 + Math.round(rnd() * 20);
-      const started = new Date(Date.now() - hoursAgo * 3600e3 * (i === count - 1 ? 1 : 1)).toISOString();
+      // spread over about five weeks, at plausible daytime hours; the newest session is from earlier today
+      const when = new Date();
+      if (i === count - 1) when.setHours(when.getHours() - 3);
+      else { when.setDate(when.getDate() - Math.round((count - 1 - i) * 2.4)); when.setHours(8 + Math.floor(rnd() * 10), Math.floor(rnd() * 60), 0, 0); }
+      const started = when.toISOString();
       out.push(E.buildSession({ user: userId, organ, startedAt: started, samples }));
     }
     return out;
